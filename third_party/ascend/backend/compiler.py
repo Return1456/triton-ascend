@@ -1181,7 +1181,8 @@ def get_libdevice():
 
 
 def _is_a5_target_arch(arch: str) -> bool:
-    return isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950"))
+    # A6 shares the register-based lowering and launch ABI with A5.
+    return isinstance(arch, str) and (arch == "Ascend910_9691" or arch.startswith(("Ascend910_95", "Ascend950")))
 
 
 def _get_libdevice_compile_state() -> bool:
@@ -1390,7 +1391,7 @@ class NPUOptions:
         object.__setattr__(
             self,
             "compile_on_910_95",
-            isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950")),
+            _is_a5_target_arch(arch),
         )
         try:
             normalized_rule_mask = normalize_graph_optimization_rule_mask(rule_mask)
