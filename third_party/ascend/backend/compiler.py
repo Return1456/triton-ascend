@@ -1180,8 +1180,10 @@ def get_libdevice():
     return os.path.join(current, "lib/libdevice.10.bc")
 
 
-def _is_a5_target_arch(arch: str) -> bool:
-    return isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950"))
+def _is_register_based_target_arch(arch: str) -> bool:
+    # A6 shares the register-based lowering and launch ABI with A5.
+    return isinstance(arch, str) and (arch.startswith(("Ascend910_96", "Ascend960")) or arch.startswith(
+        ("Ascend910_95", "Ascend950")))
 
 
 def _get_libdevice_compile_state() -> bool:
@@ -1210,7 +1212,7 @@ def _normalize_compile_mode(compile_mode, arch: str) -> str:
         raise ValueError(f"invalid compile_mode={compile_mode!r}; expected one of: " +
                          ", ".join(_CANONICAL_COMPILE_MODES))
 
-    if canonical_mode == "simt_only" and not _is_a5_target_arch(arch):
+    if canonical_mode == "simt_only" and not _is_register_based_target_arch(arch):
         raise ValueError('compile_mode="simt_only" is supported only on Ascend 950 targets.')
     return canonical_mode
 
@@ -1390,7 +1392,7 @@ class NPUOptions:
         object.__setattr__(
             self,
             "compile_on_910_95",
-            isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950")),
+            _is_register_based_target_arch(arch),
         )
         try:
             normalized_rule_mask = normalize_graph_optimization_rule_mask(rule_mask)
@@ -1443,7 +1445,7 @@ _INTERNAL_NPU_OPTION_MARKERS = frozenset({
 def _is_internal_npu_options(options, target_arch: str) -> bool:
     """Recognize an NPUOptions metadata round trip by backend-only fields."""
     return (_INTERNAL_NPU_OPTION_MARKERS <= options.keys() and options.get("target_arch") == target_arch
-            and options.get("compile_on_910_95") == _is_a5_target_arch(target_arch))
+            and options.get("compile_on_910_95") == _is_register_based_target_arch(target_arch))
 
 
 def _normalize_bishengir_simt_optimization_for_context(options: NPUOptions, raw_options) -> None:
@@ -1452,7 +1454,7 @@ def _normalize_bishengir_simt_optimization_for_context(options: NPUOptions, raw_
     if option_name not in raw_options:
         return
 
-    if _is_a5_target_arch(options.target_arch) and options.is_pure_simt:
+    if _is_register_based_target_arch(options.target_arch) and options.is_pure_simt:
         # The BiShengIR toolchain owns the option's value grammar; keep the
         # Python boundary free of numeric or range validation.
         return
