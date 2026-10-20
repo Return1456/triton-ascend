@@ -20,13 +20,18 @@ def load_policies(path, names):
 
 
 class A6TargetContract(unittest.TestCase):
+
     @classmethod
     def setUpClass(cls):
         backend = Path(__file__).resolve().parents[2] / 'backend'
-        cls.utils = load_policies(backend / 'utils.py', {
-            'is_compile_on_910_95', 'is_ffts_supported', 'force_disable_ffts',
-            'ub_size_in_kbytes_for_arch', 'graph_ub_budget_bytes_for_arch',
-        })
+        cls.utils = load_policies(
+            backend / 'utils.py', {
+                'is_compile_on_910_95',
+                'is_ffts_supported',
+                'force_disable_ffts',
+                'ub_size_in_kbytes_for_arch',
+                'graph_ub_budget_bytes_for_arch',
+            })
         cls.compiler = load_policies(backend / 'compiler.py', {'_is_a5_target_arch'})
 
     def test_target_policy(self):
@@ -44,7 +49,7 @@ class A6TargetContract(unittest.TestCase):
                 self.assertEqual(self.utils['is_compile_on_910_95'](arch), register_based)
                 self.assertEqual(self.compiler['_is_a5_target_arch'](arch), register_based)
                 self.assertEqual(self.utils['ub_size_in_kbytes_for_arch'](arch), ub)
-                self.assertEqual(self.utils['graph_ub_budget_bytes_for_arch'](arch), ub * 512)
+                self.assertEqual(self.utils['graph_ub_budget_bytes_for_arch'](arch), ub * 1024 * 80 // 100)
 
     def test_launch_and_compiler_ffts_policy(self):
         for arch in ('Ascend910_9691', 'Ascend910_958b', 'Ascend950'):
