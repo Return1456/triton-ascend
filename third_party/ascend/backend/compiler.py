@@ -1213,7 +1213,7 @@ def _normalize_compile_mode(compile_mode, arch: str) -> str:
                          ", ".join(_CANONICAL_COMPILE_MODES))
 
     if canonical_mode == "simt_only" and not _is_register_based_target_arch(arch):
-        raise ValueError('compile_mode="simt_only" is supported only on Ascend 950 targets.')
+        raise ValueError('compile_mode="simt_only" is supported only on Ascend 950/960 targets.')
     return canonical_mode
 
 
