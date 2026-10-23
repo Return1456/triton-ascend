@@ -569,6 +569,8 @@ def _parse_ttir_metadata(ttir: str, metadata: dict):
 
 def get_common_bishengir_compile_options(metadata):
     bishengir_target = metadata['target'].arch
+    if bishengir_target.startswith(("Ascend910_96", "Ascend960")):
+        bishengir_target = "950DT_95A3"
     bishengir_target_opt = f"--target={bishengir_target}"
     return [bishengir_target_opt]
 
