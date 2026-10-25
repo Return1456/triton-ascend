@@ -23,8 +23,8 @@ class AscendArchGen(IntEnum):
     """Compiler backend generations that need distinct lowering or policy."""
 
     LEGACY = auto()  # A2 / A3: 910A/B/D, 910_93, 310B
-    GEN5 = auto()    # A5: Ascend 950 / 910_95
-    GEN6 = auto()    # A6: Ascend 960 / 910_96
+    GEN5 = auto()  # A5: Ascend 950 / 910_95
+    GEN6 = auto()  # A6: Ascend 960 / 910_96
 
 
 # Ordered table -- longer/more-specific prefixes must come first so that
@@ -33,10 +33,9 @@ class AscendArchGen(IntEnum):
 _ARCH_TABLE = (
     (("Ascend910_96", "Ascend960"), AscendArchGen.GEN6, 320, 128, {"ffts_disabled": True}),
     (("Ascend910_95", "Ascend950"), AscendArchGen.GEN5, 256, 128, {"ffts_disabled": True}),
-    (("Ascend910A", "Ascend310B4"), AscendArchGen.LEGACY, 192, None,
-     {"ffts_disabled": True}),
-    (("Ascend910B", "Ascend910D", "Ascend910_93", "Ascend310B"),
-     AscendArchGen.LEGACY, 192, None, {"ffts_disabled": False}),
+    (("Ascend910A", "Ascend310B4"), AscendArchGen.LEGACY, 192, None, {"ffts_disabled": True}),
+    (("Ascend910B", "Ascend910D", "Ascend910_93", "Ascend310B"), AscendArchGen.LEGACY, 192, None,
+     {"ffts_disabled": False}),
 )
 
 
