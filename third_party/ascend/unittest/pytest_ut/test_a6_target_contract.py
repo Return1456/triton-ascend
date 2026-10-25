@@ -47,10 +47,10 @@ class A6TargetContract(unittest.TestCase):
 
     def test_target_policy(self):
         for arch, register_based, ub in [
-            ('Ascend910_9691', True, 376),
-            ('Ascend910_9699', True, 376),
-            ('Ascend960', True, 376),
-            ('Ascend960DT_9691', True, 376),
+            ('Ascend910_9691', True, 320),
+            ('Ascend910_9699', True, 320),
+            ('Ascend960', True, 320),
+            ('Ascend960DT_9691', True, 320),
             ('Ascend910_958b', True, 256),
             ('Ascend950DT_9571', True, 256),
             ('Ascend910B1', False, 192),
