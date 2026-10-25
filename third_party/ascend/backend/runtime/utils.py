@@ -22,6 +22,8 @@
 
 import torch
 
+from triton.backends.ascend import ascend_arch
+
 _cached_params = None
 
 
@@ -43,11 +45,7 @@ def _init_npu_params():
     # not yet listed in the compiler-side architecture table.  Graph
     # optimization intentionally treats that case as zero budget instead.
     ub_size_in_kbytes = ub_size_in_kbytes_for_arch(target.arch) or 192
-    rf_size_in_kbytes = None
-
-    if (target.arch.startswith("Ascend910_95") or target.arch.startswith("Ascend950")
-            or target.arch.startswith("Ascend910_96") or target.arch.startswith("Ascend960")):
-        rf_size_in_kbytes = 128
+    rf_size_in_kbytes = ascend_arch.rf_size_in_kbytes_for_arch(target.arch)
 
     _cached_params = {
         'target': target,

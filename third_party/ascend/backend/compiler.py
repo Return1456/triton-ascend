@@ -69,6 +69,7 @@ from triton.backends.ascend.utils import (
     get_cann_version_file_hash,
     is_cann_version_at_least,
 )
+from triton.backends.ascend import ascend_arch
 from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.ascend.program_grid import (
     DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK,
@@ -588,7 +589,7 @@ def _full_row_copy_compile_options(metadata, compiler_path):
     # A shared noinline load helper loses constant-width specialization when
     # the masked tail also calls it. Scope this to compiler-versioned A5 SIMD
     # loads; other kernels retain the NPU compiler's default inlining policy.
-    if (metadata.get("has_full_row_copy", False) and metadata["target"].arch.startswith("Ascend950")
+    if (metadata.get("has_full_row_copy", False) and ascend_arch.is_register_based_arch(metadata["target"].arch)
             and metadata.get("mix_mode") == "aiv" and metadata.get("parallel_mode") == "simd"
             and _supports_full_row_copy_inlining(compiler_path)):
         return ["--enable-lib-call-no-inline=false"]
@@ -1115,9 +1116,8 @@ def get_libdevice():
 
 
 def _is_register_based_target_arch(arch: str) -> bool:
-    # A6 shares the register-based lowering and launch ABI with A5.
-    return isinstance(arch, str) and (arch.startswith(("Ascend910_96", "Ascend960")) or arch.startswith(
-        ("Ascend910_95", "Ascend950")))
+    """Delegate to the centralized ascend_arch generation table."""
+    return ascend_arch.is_register_based_arch(arch)
 
 
 def _get_libdevice_compile_state() -> bool:
