@@ -24,29 +24,27 @@ class AscendArchTableTest(unittest.TestCase):
     def test_register_based_generations(self):
         gen5 = self.mod.AscendArchGen.GEN5
         gen6 = self.mod.AscendArchGen.GEN6
-        for arch in ("Ascend910_95", "Ascend950", "Ascend910_958b",
-                      "Ascend910_96", "Ascend960", "Ascend960DT_9691"):
+        for arch in ("Ascend910_95", "Ascend950", "Ascend910_958b", "Ascend910_96", "Ascend960", "Ascend960DT_9691"):
             with self.subTest(arch=arch):
                 gen = self.mod.arch_generation(arch)
                 self.assertIn(gen, (gen5, gen6))
                 self.assertTrue(self.mod.is_register_based_arch(arch))
 
     def test_legacy_not_register_based(self):
-        for arch in ("Ascend910A", "Ascend910B1", "Ascend910_93",
-                      "Ascend310B", "Ascend910_97", ""):
+        for arch in ("Ascend910A", "Ascend910B1", "Ascend910_93", "Ascend310B", "Ascend910_97", ""):
             with self.subTest(arch=arch):
                 self.assertFalse(self.mod.is_register_based_arch(arch))
 
     def test_ub_and_rf_capacity(self):
         cases = {
-            "Ascend960":     (320, 128),
-            "Ascend910_96":  (320, 128),
-            "Ascend950":     (256, 128),
-            "Ascend910_95":  (256, 128),
-            "Ascend910B1":   (192, None),
-            "Ascend910A":    (192, None),
-            "Ascend910_97":  (0, None),
-            "":              (0, None),
+            "Ascend960": (320, 128),
+            "Ascend910_96": (320, 128),
+            "Ascend950": (256, 128),
+            "Ascend910_95": (256, 128),
+            "Ascend910B1": (192, None),
+            "Ascend910A": (192, None),
+            "Ascend910_97": (0, None),
+            "": (0, None),
         }
         for arch, (ub, rf) in cases.items():
             with self.subTest(arch=arch):
