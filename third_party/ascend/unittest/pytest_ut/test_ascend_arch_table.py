@@ -39,8 +39,8 @@ class AscendArchTableTest(unittest.TestCase):
 
     def test_ub_and_rf_capacity(self):
         cases = {
-            "Ascend960":     (376, 128),
-            "Ascend910_96":  (376, 128),
+            "Ascend960":     (320, 128),
+            "Ascend910_96":  (320, 128),
             "Ascend950":     (256, 128),
             "Ascend910_95":  (256, 128),
             "Ascend910B1":   (192, None),

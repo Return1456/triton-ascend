@@ -31,7 +31,7 @@ class AscendArchGen(IntEnum):
 # e.g. "Ascend910_96" does not shadow "Ascend910A".
 # Tuple shape: (prefixes, gen, ub_kb, rf_kb, flags)
 _ARCH_TABLE = (
-    (("Ascend910_96", "Ascend960"), AscendArchGen.GEN6, 376, 128, {"ffts_disabled": True}),
+    (("Ascend910_96", "Ascend960"), AscendArchGen.GEN6, 320, 128, {"ffts_disabled": True}),
     (("Ascend910_95", "Ascend950"), AscendArchGen.GEN5, 256, 128, {"ffts_disabled": True}),
     (("Ascend910A", "Ascend310B4"), AscendArchGen.LEGACY, 192, None,
      {"ffts_disabled": True}),
