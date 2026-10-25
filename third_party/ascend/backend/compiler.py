@@ -1371,6 +1371,14 @@ def _get_npu_options_arch(options: NPUOptions) -> str:
 
 NPUOptions.arch = property(_get_npu_options_arch)
 
+
+def _get_compile_on_register_based(options) -> bool:
+    """Modern accessor for the register-based (A5/A6) compile pipeline."""
+    return ascend_arch.is_register_based_arch(options.target_arch)
+
+
+NPUOptions.compile_on_register_based = property(_get_compile_on_register_based)
+
 _INTERNAL_NPU_OPTION_MARKERS = frozenset({
     "target_arch",
     "compile_on_910_95",

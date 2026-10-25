@@ -38,6 +38,9 @@ import pybind11
 
 from triton.backends.ascend import ascend_arch
 
+# Cached result of the runtime SOC detection used by is_compile_on_910_95().
+# Must be initialized here: the accessor below declares it ``global`` and reads
+# it before assigning, so a missing module-level binding raises NameError.
 _is_compile_on_910_95 = None
 
 
