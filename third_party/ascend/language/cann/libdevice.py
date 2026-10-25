@@ -22,7 +22,8 @@ from math import pi as math_pi
 from triton.language import core, math, semantic, standard
 from triton._C.libtriton import ir
 from triton.runtime.jit import jit
-from triton.backends.ascend.utils import is_compile_on_910_95, triton_enable_libdevice_simt
+from triton.backends.ascend.ascend_arch import is_register_based_arch
+from triton.backends.ascend.utils import triton_enable_libdevice_simt
 
 from .utils import _deprecated
 
@@ -32,7 +33,7 @@ def _is_libdevice_simt_enabled(_semantic) -> bool:
 
 
 def _is_a5_target(_semantic) -> bool:
-    return is_compile_on_910_95(_semantic.builder.options.arch)
+    return is_register_based_arch(_semantic.builder.options.arch)
 
 
 class _FlipStaticRange:

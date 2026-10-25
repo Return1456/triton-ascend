@@ -14,7 +14,17 @@ from unittest.mock import patch
 def load_policies(path, names):
     tree = ast.parse(path.read_text())
     nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    import importlib.util as _ilu, sys as _sys
+    backend_dir = str(path.parent)
+    if backend_dir not in _sys.path:
+        _sys.path.insert(0, backend_dir)
     namespace = {'_is_compile_on_910_95': None, '_warn_deprecated_ascend_env_var': lambda name: None}
+    if 'ascend_arch' not in _sys.modules:
+        _spec = _ilu.spec_from_file_location('ascend_arch', path.parent / 'ascend_arch.py')
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _sys.modules['ascend_arch'] = _mod
+    namespace['ascend_arch'] = _sys.modules['ascend_arch']
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
     return namespace
 

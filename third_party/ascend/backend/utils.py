@@ -36,8 +36,7 @@ from triton.backends.ascend.backend_register import backend_strategy_registry
 
 import pybind11
 
-_is_compile_on_910_95 = None
-
+from triton.backends.ascend import ascend_arch
 
 def _multibuffer_mode_to_tuple(value):
     """Freeze a mode dictionary, or restore its pairs from a JSON cache.
@@ -305,22 +304,31 @@ def _warn_deprecated_ascend_env_vars() -> None:
 
 
 def is_compile_on_910_95(arch: str = None) -> bool:
-    """Return whether the target uses the A5/A6 register-based pipeline."""
+    """Deprecated; use is_register_based_arch instead.
+
+    Retains runtime SOC detection when called without an explicit arch.
+    """
     if arch is not None:
-        return isinstance(arch, str) and (arch.startswith(("Ascend910_96", "Ascend960")) or arch.startswith(
-            ("Ascend910_95", "Ascend950")))
+        return ascend_arch.is_register_based_arch(arch)
 
     global _is_compile_on_910_95
     if _is_compile_on_910_95 is None:
         try:
             import acl
             name_lower = acl.get_soc_name().lower()
-            _is_compile_on_910_95 = ("ascend910_95" in name_lower or "ascend950" in name_lower
-                                     or "910_958b" in name_lower or "ascend910_96" in name_lower
-                                     or "ascend960" in name_lower)
+            _is_compile_on_910_95 = ascend_arch.is_register_based_arch(name_lower)
         except (ImportError, AttributeError):
             _is_compile_on_910_95 = False
     return _is_compile_on_910_95
+
+
+def is_register_based_arch(arch: str = None) -> bool:
+    """Return whether the target uses the register-based (A5/A6) compile pipeline.
+
+    Public alias for the centralized arch classification; delegates to
+    the centralized ascend_arch generation table.
+    """
+    return ascend_arch.is_register_based_arch(arch)
 
 
 AUTO_BLOCKIFY_BLACKLIST_RULES = (
@@ -1042,19 +1050,11 @@ def get_ascend_arch_from_env():
 def ub_size_in_kbytes_for_arch(arch: str) -> int:
     """Return the raw UB capacity for a supported Ascend target architecture.
 
-    This resolver is deliberately independent of the active runtime device so
-    compiler options can be normalized for an explicit compilation target.
-    Unknown and empty targets fail closed instead of guessing a UB capacity.
+    Delegates to the centralized ascend_arch generation table so the table
+    is the single source of truth for per-generation capacities.  Unknown and
+    empty targets fail closed instead of guessing a UB capacity.
     """
-    if not isinstance(arch, str) or not arch:
-        return 0
-    if arch.startswith(("Ascend910_96", "Ascend960")):
-        return 376
-    if arch.startswith(("Ascend910_95", "Ascend950")):
-        return 256
-    if arch.startswith(("Ascend910A", "Ascend910B", "Ascend910D", "Ascend910_93", "Ascend310B")):
-        return 192
-    return 0
+    return ascend_arch.ub_size_in_kbytes_for_arch(arch)
 
 
 def graph_ub_budget_bytes_for_arch(arch: str) -> int:
@@ -1067,18 +1067,20 @@ def graph_ub_budget_bytes_for_arch(arch: str) -> int:
 
 
 def is_ffts_supported(arch: str):
-    """Return whether the specified compilation target supports FFTS."""
-    if not isinstance(arch, str) or not arch:
-        return False
-    if is_compile_on_910_95(arch) or arch in ["Ascend910A", "Ascend310B4"]:
-        return False
-    return True
+    """Return whether the specified compilation target supports FFTS.
+
+    Delegates to the centralized ascend_arch generation table.
+    """
+    return ascend_arch.is_ffts_supported(arch)
 
 
 def force_disable_ffts(arch: str) -> bool:
-    """Return whether the selected target requires FFTS to be disabled."""
+    """Return whether the selected target requires FFTS to be disabled.
+
+    Delegates to the centralized ascend_arch generation table.
+    """
     _warn_deprecated_ascend_env_var("TRITON_DISABLE_FFTS")
-    return is_compile_on_910_95(arch)
+    return ascend_arch.is_ffts_disabled_arch(arch)
 
 
 def _parse_cann_version(line: str):
@@ -1142,7 +1144,7 @@ def cann_version_compile_args():
 
 def triton_enable_libdevice_simt(arch: str = None) -> bool:
     """Return whether the environment switch selects SIMT libdevice."""
-    return bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and is_compile_on_910_95(arch)
+    return bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and ascend_arch.is_register_based_arch(arch)
 
 
 def get_cann_version_file_hash():
