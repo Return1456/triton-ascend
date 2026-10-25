@@ -38,6 +38,12 @@ import pybind11
 
 from triton.backends.ascend import ascend_arch
 
+# Cached result of the runtime SOC detection used by is_compile_on_910_95().
+# Must be initialized here: the accessor below declares it ``global`` and reads
+# it before assigning, so a missing module-level binding raises NameError.
+_is_compile_on_910_95 = None
+
+
 def _multibuffer_mode_to_tuple(value):
     """Freeze a mode dictionary, or restore its pairs from a JSON cache.
 
@@ -1077,10 +1083,13 @@ def is_ffts_supported(arch: str):
 def force_disable_ffts(arch: str) -> bool:
     """Return whether the selected target requires FFTS to be disabled.
 
-    Delegates to the centralized ascend_arch generation table.
+    Only the register-based (A5/A6) pipeline forces FFTS off.  Legacy targets
+    such as Ascend910A / Ascend310B4 report FFTS as unsupported via
+    ``is_ffts_supported`` but must not be forced to pass ``--disable-ffts``;
+    keeping that distinction preserves the pre-refactor compile options.
     """
     _warn_deprecated_ascend_env_var("TRITON_DISABLE_FFTS")
-    return ascend_arch.is_ffts_disabled_arch(arch)
+    return ascend_arch.is_register_based_arch(arch)
 
 
 def _parse_cann_version(line: str):

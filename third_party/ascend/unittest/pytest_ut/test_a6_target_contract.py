@@ -42,7 +42,8 @@ class A6TargetContract(unittest.TestCase):
                 'ub_size_in_kbytes_for_arch',
                 'graph_ub_budget_bytes_for_arch',
             })
-        cls.compiler = load_policies(backend / 'compiler.py', {'_is_register_based_target_arch'})
+        cls.compiler = load_policies(backend / 'compiler.py',
+                                     {'_is_register_based_target_arch', '_get_compile_on_register_based'})
 
     def test_target_policy(self):
         for arch, register_based, ub in [
@@ -71,6 +72,47 @@ class A6TargetContract(unittest.TestCase):
                 self.assertFalse(self.utils['is_ffts_supported'](arch))
         self.assertFalse(self.utils['force_disable_ffts']('Ascend910B1'))
         self.assertTrue(self.utils['is_ffts_supported']('Ascend910B1'))
+
+    def test_legacy_ffts_targets_are_not_force_disabled(self):
+        """Ascend910A / Ascend310B4 lack FFTS support but must not force the flag.
+
+        ``force_disable_ffts`` drives an explicit ``--disable-ffts`` compile
+        option, so widening it to every FFTS-unsupported target would silently
+        change the legacy A2 compile command line.
+        """
+        for arch in ('Ascend910A', 'Ascend310B4'):
+            with self.subTest(arch=arch):
+                self.assertFalse(self.utils['force_disable_ffts'](arch))
+                self.assertFalse(self.utils['is_ffts_supported'](arch))
+
+    def test_compile_on_register_based_accessor(self):
+        """The NPUOptions accessor must resolve, not leak the property object."""
+        accessor = self.compiler['_get_compile_on_register_based']
+
+        class _Options:
+            target_arch = 'Ascend950'
+
+        self.assertTrue(accessor(_Options()))
+        _Options.target_arch = 'Ascend910_96'
+        self.assertTrue(accessor(_Options()))
+        _Options.target_arch = 'Ascend910B1'
+        self.assertFalse(accessor(_Options()))
+
+    def test_soc_detection_cache_is_initialized(self):
+        """utils.py must bind the SOC-detection cache at module scope.
+
+        ``is_compile_on_910_95`` declares it ``global`` and reads it before
+        assigning, so a missing module-level binding raises NameError.
+        """
+        backend = Path(__file__).resolve().parents[2] / 'backend'
+        tree = ast.parse((backend / 'utils.py').read_text())
+        assigned = {
+            target.id
+            for node in tree.body if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            if isinstance(target, ast.Name)
+        }
+        self.assertIn('_is_compile_on_910_95', assigned)
 
     def test_runtime_soc_detection(self):
         for soc_name, detected in (
