@@ -53,17 +53,24 @@ class AscendArchGen(IntEnum):
 
 # Ordered table -- longer/more-specific prefixes must come first so that
 # e.g. "Ascend910_96" does not shadow "Ascend910A".
-# Tuple shape: (prefixes, gen, ub_kb, rf_kb, ffts_disabled)
+# Tuple shape: (prefixes, gen, ub_kb, rf_kb)
 _ARCH_TABLE = (
-    (("Ascend910_96", "Ascend960"), AscendArchGen.GEN6, 320, 128, True),
-    (("Ascend910_95", "Ascend950"), AscendArchGen.GEN5, 256, 128, True),
-    (("Ascend910A", "Ascend310B4"), AscendArchGen.LEGACY, 192, None, True),
-    (("Ascend910B", "Ascend910D", "Ascend910_93", "Ascend310B"), AscendArchGen.LEGACY, 192, None, False),
+    (("Ascend910_96", "Ascend960"), AscendArchGen.GEN6, 320, 128),
+    (("Ascend910_95", "Ascend950"), AscendArchGen.GEN5, 256, 128),
+    (("Ascend910A", "Ascend310B4", "Ascend910B", "Ascend910D", "Ascend910_93", "Ascend310B"), AscendArchGen.LEGACY, 192,
+     None),
 )
+
+# Legacy SOC names without FFTS support.  Compared *exactly*, not by prefix:
+# the predicate historically tested ``arch in ["Ascend910A", "Ascend310B4"]``,
+# so a distinct SOC that merely shares a prefix (e.g. "Ascend910A2") keeps
+# FFTS.  Register-based targets (A5 / A6) lack FFTS by generation and are
+# covered by ``is_register_based_arch`` instead.
+_FFTS_UNSUPPORTED_ARCHS = ("Ascend910A", "Ascend310B4")
 
 
 def _match_arch_entry(arch):
-    """Return the (gen, ub_kb, rf_kb, ffts_disabled) entry for *arch*, or None.
+    """Return the (gen, ub_kb, rf_kb) entry for *arch*, or None.
 
     Matching is case-insensitive so this works with both the uppercase arch
     prefixes used in compiler options (e.g. "Ascend910_96") and the lowercase
@@ -72,9 +79,9 @@ def _match_arch_entry(arch):
     if not isinstance(arch, str) or not arch:
         return None
     arch_lower = arch.lower()
-    for prefixes, gen, ub_kb, rf_kb, ffts_disabled in _ARCH_TABLE:
+    for prefixes, gen, ub_kb, rf_kb in _ARCH_TABLE:
         if any(arch_lower.startswith(prefix.lower()) for prefix in prefixes):
-            return gen, ub_kb, rf_kb, ffts_disabled
+            return gen, ub_kb, rf_kb
     return None
 
 
@@ -1145,14 +1152,19 @@ def graph_ub_budget_bytes_for_arch(arch: str) -> int:
 def is_ffts_supported(arch: str) -> bool:
     """Return whether the specified compilation target supports FFTS.
 
-    Single FFTS predicate for the backend, resolved from ``_ARCH_TABLE``.
-    ``force_disable_ffts`` is a separate policy question: it additionally
-    requires the register-based (A5/A6) pipeline, because legacy targets that
-    merely lack FFTS support must not start emitting ``--disable-ffts``.
-    Unknown and empty targets fail closed and report no FFTS support.
+    This is a *capability* query and is deliberately not the same question as
+    ``force_disable_ffts``, which is a *policy* query ("do we pass
+    ``--disable-ffts``?").  They disagree on Ascend910A / Ascend310B4: those
+    targets have no FFTS support but keep their historical command line, so
+    they are not force-disabled.
+
+    Non-string and empty targets report no FFTS support.  Any other target
+    that is not known to lack FFTS defaults to supported, so a SOC missing
+    from ``_ARCH_TABLE`` keeps the launch-time FFTS flag.
     """
-    entry = _match_arch_entry(arch)
-    return entry is not None and not entry[3]
+    if not isinstance(arch, str) or not arch:
+        return False
+    return not (is_register_based_arch(arch) or arch in _FFTS_UNSUPPORTED_ARCHS)
 
 
 def force_disable_ffts(arch: str) -> bool:
@@ -1162,6 +1174,9 @@ def force_disable_ffts(arch: str) -> bool:
     such as Ascend910A / Ascend310B4 report FFTS as unsupported via
     ``is_ffts_supported`` but must not be forced to pass ``--disable-ffts``;
     keeping that distinction preserves the pre-refactor compile options.
+
+    Invariant: every register-based generation also lacks FFTS support, so
+    ``force_disable_ffts(arch)`` implies ``not is_ffts_supported(arch)``.
     """
     _warn_deprecated_ascend_env_var("TRITON_DISABLE_FFTS")
     return is_register_based_arch(arch)

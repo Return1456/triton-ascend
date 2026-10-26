@@ -21,6 +21,9 @@ _ARCH_FUNCTIONS = {
     "is_ffts_supported",
 }
 
+# Module-level constants the extracted functions close over.
+_ARCH_CONSTANTS = {"_ARCH_TABLE", "_FFTS_UNSUPPORTED_ARCHS"}
+
 
 def load_arch_table():
     """Extract the arch-classification block from ``utils.py``."""
@@ -31,7 +34,7 @@ def load_arch_table():
         if isinstance(node, ast.ClassDef) and node.name == "AscendArchGen":
             nodes.append(node)
         elif isinstance(node, ast.Assign) and any(
-                isinstance(target, ast.Name) and target.id == "_ARCH_TABLE" for target in node.targets):
+                isinstance(target, ast.Name) and target.id in _ARCH_CONSTANTS for target in node.targets):
             nodes.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in _ARCH_FUNCTIONS:
             nodes.append(node)
