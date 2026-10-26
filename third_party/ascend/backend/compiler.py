@@ -68,7 +68,6 @@ from triton.backends.ascend.utils import (
     ub_size_in_kbytes_for_arch,
     get_cann_version_file_hash,
     is_cann_version_at_least,
-    is_register_based_arch,
 )
 from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.ascend.program_grid import (
@@ -589,6 +588,8 @@ def _full_row_copy_compile_options(metadata, compiler_path):
     # A shared noinline load helper loses constant-width specialization when
     # the masked tail also calls it. Scope this to compiler-versioned A5 SIMD
     # loads; other kernels retain the NPU compiler's default inlining policy.
+    from triton.backends.ascend.utils import is_register_based_arch
+
     if (metadata.get("has_full_row_copy", False) and is_register_based_arch(metadata["target"].arch)
             and metadata.get("mix_mode") == "aiv" and metadata.get("parallel_mode") == "simd"
             and _supports_full_row_copy_inlining(compiler_path)):
@@ -1116,7 +1117,13 @@ def get_libdevice():
 
 
 def _is_register_based_target_arch(arch: str) -> bool:
-    """Delegate to the centralized arch table in utils."""
+    """Delegate to the arch table in utils.
+
+    Imported lazily to avoid an import cycle: ``utils`` is imported during
+    backend registration and still loading when this module is first pulled
+    in, so the helper is not yet bound at import time.
+    """
+    from triton.backends.ascend.utils import is_register_based_arch
     return is_register_based_arch(arch)
 
 
@@ -1374,6 +1381,7 @@ NPUOptions.arch = property(_get_npu_options_arch)
 
 def _get_compile_on_register_based(options) -> bool:
     """Modern accessor for the register-based (A5/A6) compile pipeline."""
+    from triton.backends.ascend.utils import is_register_based_arch
     return is_register_based_arch(options.target_arch)
 
 

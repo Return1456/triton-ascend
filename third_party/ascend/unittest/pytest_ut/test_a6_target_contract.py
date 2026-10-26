@@ -63,11 +63,51 @@ def load_arch_utils():
 
 
 def load_policies(path, names, extra=None):
+    """Exec just the named functions from *path* (no module import required).
+
+    The compiler policy functions were authored to ``import`` their own
+    dependency lazily, so we inject a lightweight ``triton.backends.ascend``
+    package shim into ``sys.modules`` that re-exports the arch helpers already
+    extracted from ``utils.py``.  This keeps the offline test importable
+    without a Trtion wheel while exercising the real function bodies.
+    """
     tree = ast.parse(path.read_text())
     nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     namespace = dict(extra or {})
     namespace.setdefault("_warn_deprecated_ascend_env_var", lambda name: None)
+    # Inject a triton shim so lazy ``from triton.backends.ascend.utils import …``
+    # inside the policy bodies resolves to the helpers we already extracted.
+    if not _triton_shim_installed():
+        _install_triton_shim(namespace.get("is_register_based_arch"))
     return _exec_nodes(path, nodes, namespace)
+
+
+def _triton_shim_installed():
+    try:
+        import triton.backends.ascend.utils as u  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(u, "is_register_based_arch")
+
+
+def _install_triton_shim(is_register_based_ref):
+    import sys
+    import types
+
+    root = types.ModuleType("triton")
+    root.__path__ = []
+    sys.modules["triton"] = root
+    backends = types.ModuleType("triton.backends")
+    backends.__path__ = []
+    root.backends = backends
+    sys.modules["triton.backends"] = backends
+    ascend_pkg = types.ModuleType("triton.backends.ascend")
+    ascend_pkg.__path__ = []
+    ascend_pkg.utils = types.ModuleType("triton.backends.ascend.utils")
+    ascend_pkg.utils.is_register_based_arch = is_register_based_ref
+    sys.modules["triton.backends.ascend"] = ascend_pkg
+    sys.modules["triton.backends.ascend.utils"] = ascend_pkg.utils
+    backends.ascend = ascend_pkg
 
 
 class A6TargetContract(unittest.TestCase):
