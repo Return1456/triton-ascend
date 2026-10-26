@@ -38,7 +38,7 @@ import triton.language.core as tl
 import triton.extension.buffer.language as bl
 from triton.language.core import _unwrap_if_constexpr
 from triton.backends.ascend.driver import NPUUtils
-from triton.backends.ascend.ascend_arch import is_register_based_arch
+from triton.backends.ascend.utils import is_register_based_arch
 
 from . import semantic as semantic
 

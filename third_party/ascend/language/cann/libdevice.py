@@ -22,7 +22,7 @@ from math import pi as math_pi
 from triton.language import core, math, semantic, standard
 from triton._C.libtriton import ir
 from triton.runtime.jit import jit
-from triton.backends.ascend.ascend_arch import is_register_based_arch
+from triton.backends.ascend.utils import is_register_based_arch
 from triton.backends.ascend.utils import triton_enable_libdevice_simt
 
 from .utils import _deprecated

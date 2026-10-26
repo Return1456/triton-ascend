@@ -10,7 +10,7 @@ from triton.language import semantic, core, standard
 from triton.language.core import (_unwrap_if_constexpr, _tensor_member_fn, _unwrap_iterable, builtin, constexpr, dtype,
                                   tensor, check_bit_width, _unwrap_if_constexpr, range)
 
-from triton.backends.ascend.ascend_arch import is_register_based_arch
+from triton.backends.ascend.utils import is_register_based_arch
 from .aux_ops import compile_hint_impl
 
 from typing import Optional, Tuple, List, overload

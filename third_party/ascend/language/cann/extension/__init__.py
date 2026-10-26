@@ -1,4 +1,4 @@
-from triton.backends.ascend.ascend_arch import is_register_based_arch
+from triton.backends.ascend.utils import is_register_based_arch
 from triton._C.libtriton.ascend import ir as _ascend_ir
 
 # MLIR affine bindings (same objects as triton._C.libtriton.ascend.ir).

@@ -70,11 +70,11 @@ def arch_bucket(arch):
     by generation only for bucket-specific tuning heuristics.
     """
     try:
-        from triton.backends.ascend import ascend_arch
-        gen = ascend_arch.arch_generation(arch)
-        if gen == ascend_arch.AscendArchGen.GEN6:
+        from triton.backends.ascend.utils import AscendArchGen, arch_generation
+        gen = arch_generation(arch)
+        if gen == AscendArchGen.GEN6:
             return "a6"
-        return "a5" if gen == ascend_arch.AscendArchGen.GEN5 else "a2"
+        return "a5" if gen == AscendArchGen.GEN5 else "a2"
     except Exception:
         return "a2"
 

@@ -31,17 +31,94 @@ import warnings
 from pathlib import Path
 import logging
 import platform
+from enum import IntEnum, auto
 from triton import knobs
 from triton.backends.ascend.backend_register import backend_strategy_registry
 
 import pybind11
 
-from triton.backends.ascend import ascend_arch
+# --- Ascend target-architecture classification -------------------------------
+# Single source of truth for generation membership, UB / RF capacities, and the
+# FFTS policy.  A6 devices reuse the A5 register-based pipeline, so they are
+# described as a sibling generation rather than hardcoded inline everywhere.
+
+
+class AscendArchGen(IntEnum):
+    """Compiler backend generations that need distinct lowering or policy."""
+
+    LEGACY = auto()  # A2 / A3: 910A/B/D, 910_93, 310B
+    GEN5 = auto()  # A5: Ascend 950 / 910_95
+    GEN6 = auto()  # A6: Ascend 960 / 910_96
+
+
+# Ordered table -- longer/more-specific prefixes must come first so that
+# e.g. "Ascend910_96" does not shadow "Ascend910A".
+# Tuple shape: (prefixes, gen, ub_kb, rf_kb, ffts_disabled)
+_ARCH_TABLE = (
+    (("Ascend910_96", "Ascend960"), AscendArchGen.GEN6, 320, 128, True),
+    (("Ascend910_95", "Ascend950"), AscendArchGen.GEN5, 256, 128, True),
+    (("Ascend910A", "Ascend310B4"), AscendArchGen.LEGACY, 192, None, True),
+    (("Ascend910B", "Ascend910D", "Ascend910_93", "Ascend310B"), AscendArchGen.LEGACY, 192, None, False),
+)
+
+
+def _match_arch_entry(arch):
+    """Return the (gen, ub_kb, rf_kb, ffts_disabled) entry for *arch*, or None.
+
+    Matching is case-insensitive so this works with both the uppercase arch
+    prefixes used in compiler options (e.g. "Ascend910_96") and the lowercase
+    SOC names returned by ``acl.get_soc_name()``.
+    """
+    if not isinstance(arch, str) or not arch:
+        return None
+    arch_lower = arch.lower()
+    for prefixes, gen, ub_kb, rf_kb, ffts_disabled in _ARCH_TABLE:
+        if any(arch_lower.startswith(prefix.lower()) for prefix in prefixes):
+            return gen, ub_kb, rf_kb, ffts_disabled
+    return None
+
+
+def arch_generation(arch: str = None) -> AscendArchGen:
+    """Resolve the target generation for a (possibly partial) arch string.
+
+    Unknown / empty / non-string targets resolve to ``AscendArchGen.LEGACY``.
+    """
+    entry = _match_arch_entry(arch)
+    return entry[0] if entry is not None else AscendArchGen.LEGACY
+
+
+def is_register_based_arch(arch: str = None) -> bool:
+    """Return whether the target uses the register-based (A5/A6) compile pipeline."""
+    entry = _match_arch_entry(arch)
+    return entry is not None and entry[0] in (AscendArchGen.GEN5, AscendArchGen.GEN6)
+
+
+def rf_size_in_kbytes_for_arch(arch: str = None):
+    """Return the raw RF capacity (KiB) for *arch*, or None when not applicable."""
+    entry = _match_arch_entry(arch)
+    return entry[2] if entry is not None else None
+
 
 # Cached result of the runtime SOC detection used by is_compile_on_910_95().
 # Must be initialized here: the accessor below declares it ``global`` and reads
 # it before assigning, so a missing module-level binding raises NameError.
 _is_compile_on_910_95 = None
+
+# Deprecated helpers warn at most once per process to avoid spamming callers
+# that still use them from a loop or from every test module.
+_WARNED_DEPRECATED_ARCH_HELPERS = set()
+
+
+def _warn_deprecated_arch_helper(name: str, replacement: str) -> None:
+    if name in _WARNED_DEPRECATED_ARCH_HELPERS:
+        return
+    _WARNED_DEPRECATED_ARCH_HELPERS.add(name)
+    warnings.warn(
+        f"Ascend helper '{name}' is deprecated and will be removed in a future release; "
+        f"use '{replacement}' instead.",
+        FutureWarning,
+        stacklevel=3,
+    )
 
 
 def _multibuffer_mode_to_tuple(value):
@@ -314,27 +391,19 @@ def is_compile_on_910_95(arch: str = None) -> bool:
 
     Retains runtime SOC detection when called without an explicit arch.
     """
+    _warn_deprecated_arch_helper("is_compile_on_910_95", "is_register_based_arch")
     if arch is not None:
-        return ascend_arch.is_register_based_arch(arch)
+        return is_register_based_arch(arch)
 
     global _is_compile_on_910_95
     if _is_compile_on_910_95 is None:
         try:
             import acl
             name_lower = acl.get_soc_name().lower()
-            _is_compile_on_910_95 = ascend_arch.is_register_based_arch(name_lower)
+            _is_compile_on_910_95 = is_register_based_arch(name_lower)
         except (ImportError, AttributeError):
             _is_compile_on_910_95 = False
     return _is_compile_on_910_95
-
-
-def is_register_based_arch(arch: str = None) -> bool:
-    """Return whether the target uses the register-based (A5/A6) compile pipeline.
-
-    Public alias for the centralized arch classification; delegates to
-    the centralized ascend_arch generation table.
-    """
-    return ascend_arch.is_register_based_arch(arch)
 
 
 AUTO_BLOCKIFY_BLACKLIST_RULES = (
@@ -1056,11 +1125,12 @@ def get_ascend_arch_from_env():
 def ub_size_in_kbytes_for_arch(arch: str) -> int:
     """Return the raw UB capacity for a supported Ascend target architecture.
 
-    Delegates to the centralized ascend_arch generation table so the table
-    is the single source of truth for per-generation capacities.  Unknown and
-    empty targets fail closed instead of guessing a UB capacity.
+    Resolved from the module-level ``_ARCH_TABLE`` so per-generation capacities
+    live in exactly one place.  Unknown and empty targets fail closed instead
+    of guessing a UB capacity.
     """
-    return ascend_arch.ub_size_in_kbytes_for_arch(arch)
+    entry = _match_arch_entry(arch)
+    return entry[1] if entry is not None else 0
 
 
 def graph_ub_budget_bytes_for_arch(arch: str) -> int:
@@ -1072,12 +1142,17 @@ def graph_ub_budget_bytes_for_arch(arch: str) -> int:
     return ub_size_in_kbytes_for_arch(arch) * 1024 * 80 // 100
 
 
-def is_ffts_supported(arch: str):
+def is_ffts_supported(arch: str) -> bool:
     """Return whether the specified compilation target supports FFTS.
 
-    Delegates to the centralized ascend_arch generation table.
+    Single FFTS predicate for the backend, resolved from ``_ARCH_TABLE``.
+    ``force_disable_ffts`` is a separate policy question: it additionally
+    requires the register-based (A5/A6) pipeline, because legacy targets that
+    merely lack FFTS support must not start emitting ``--disable-ffts``.
+    Unknown and empty targets fail closed and report no FFTS support.
     """
-    return ascend_arch.is_ffts_supported(arch)
+    entry = _match_arch_entry(arch)
+    return entry is not None and not entry[3]
 
 
 def force_disable_ffts(arch: str) -> bool:
@@ -1089,7 +1164,7 @@ def force_disable_ffts(arch: str) -> bool:
     keeping that distinction preserves the pre-refactor compile options.
     """
     _warn_deprecated_ascend_env_var("TRITON_DISABLE_FFTS")
-    return ascend_arch.is_register_based_arch(arch)
+    return is_register_based_arch(arch)
 
 
 def _parse_cann_version(line: str):
@@ -1153,7 +1228,7 @@ def cann_version_compile_args():
 
 def triton_enable_libdevice_simt(arch: str = None) -> bool:
     """Return whether the environment switch selects SIMT libdevice."""
-    return bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and ascend_arch.is_register_based_arch(arch)
+    return bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and is_register_based_arch(arch)
 
 
 def get_cann_version_file_hash():

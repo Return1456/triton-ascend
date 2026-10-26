@@ -33,7 +33,7 @@ from triton._C.libtriton.ascend import ir as ascend_ir
 import triton.language.core as tl
 import triton.language.extra.cann.extension as al
 import triton.extension.buffer.language as bl
-from triton.backends.ascend.ascend_arch import is_register_based_arch
+from triton.backends.ascend.utils import is_register_based_arch
 
 T = TypeVar('T')
 
