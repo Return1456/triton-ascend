@@ -3,16 +3,14 @@ pybind11
 #from CANN
 attrs
 cython
-numpy>=1.26.4,<2;python_version<'3.13'
-numpy>=2.1,<3;python_version>='3.13'
+numpy
 decorator
 sympy
 cffi
 pyyaml
 pathlib2
 psutil
-scipy>=1.13.1,<2;python_version<'3.13'
-scipy>=1.15.1,<2;python_version>='3.13'
+scipy
 requests
 absl-py
-pyelftools>=0.29
+pyelftools

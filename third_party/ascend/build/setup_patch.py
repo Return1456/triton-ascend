@@ -469,16 +469,14 @@ def _get_ascend_cmake_args():
 def _get_install_requirements():
     install_requires = [
         "attrs",
-        "numpy>=1.26.4,<2;python_version<'3.13'",
-        "numpy>=2.1,<3;python_version>='3.13'",
-        "scipy>=1.13.1,<2;python_version<'3.13'",
-        "scipy>=1.15.1,<2;python_version>='3.13'",
+        "numpy",
+        "scipy",
         "decorator",
         "psutil",
         "pyyaml",
-        "pybind11>=2.12",
+        "pybind11",
         "pandas",
-        "pyelftools>=0.29",
+        "pyelftools",
         "triton==3.6.0",
     ]
     return [*install_requires]
