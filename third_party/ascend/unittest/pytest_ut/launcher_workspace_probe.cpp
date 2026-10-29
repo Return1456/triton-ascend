@@ -8,7 +8,8 @@
 // Header-only probe for issue #2797: workspace sizing must use the full 64-bit
 // program count, while the block count handed to CANN stays 32-bit.
 //
-// usage: workspace_probe <flags> <physical_blocks> <gridX> <gridY> <gridZ> <workspace_size>
+// usage: workspace_probe <flags> <physical_blocks> <gridX> <gridY> <gridZ>
+// <workspace_size>
 int main(int argc, char **argv) {
   if (argc != 7)
     return 2;
@@ -26,7 +27,9 @@ int main(int argc, char **argv) {
   try {
     auto grid = triton::ascend::prepareGrid(spec, input);
     const uint64_t total =
-        workspaceSize ? triton::ascend::checkedMultiply(workspaceSize, grid.logicalBlocks) : 0;
+        workspaceSize
+            ? triton::ascend::checkedMultiply(workspaceSize, grid.logicalBlocks)
+            : 0;
     std::cout << grid.logicalBlocks << ' ' << grid.physicalBlocks << ' '
               << total << '\n';
     return 0;

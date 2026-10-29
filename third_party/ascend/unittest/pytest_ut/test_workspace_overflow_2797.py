@@ -45,7 +45,8 @@ def workspace_probe(tmp_path_factory):
 
 def _run(probe, flags, physical, grid, workspace_size):
     out = subprocess.check_output(
-        [str(probe), str(flags), str(physical), *map(str, grid), str(workspace_size)], text=True)
+        [str(probe), str(flags), str(physical), *map(str, grid),
+         str(workspace_size)], text=True)
     return out.split()
 
 
