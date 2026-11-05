@@ -294,6 +294,46 @@ def test_simple_persistent_matmul(BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS, DISALLOW
         assert ttgir.count(pattern) > 0, "Expect peeled mmav5 operations."
 
 
+@pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(256, 128, 16), (64, 512, 16), (512, 64, 16)])
+@pytest.mark.parametrize("NUM_WARPS", [4, 8])
+@pytest.mark.parametrize("DISALLOW_ACC_MULTI_BUFFER", [True, False])
+def test_simple_persistent_matmul_ascend_ub_tiles(BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS, DISALLOW_ACC_MULTI_BUFFER,
+                                                  device):
+    """保留原始 dtype 和断言强度，将 persistent matmul 的 tile 适配到目标 UB 容量。"""
+    if device != "npu":
+        pytest.skip("Ascend UB tile adaptation is only applicable to NPU")
+
+    adapted_tiles = {
+        (256, 128, 16): (128, 128, 16),
+        (64, 512, 16): (64, 256, 16),
+        (512, 64, 16): (256, 64, 16),
+    }
+    BLOCK_M, BLOCK_N, BLOCK_K = adapted_tiles[(BLOCK_M, BLOCK_N, BLOCK_K)]
+    accumulator_bytes = BLOCK_M * BLOCK_N * 4
+    input_bytes = (BLOCK_M + BLOCK_N) * BLOCK_K * 2
+    assert accumulator_bytes + input_bytes <= 216 * 1024
+
+    M, N, K = 1024, 512, 256
+    NUM_STAGES = 3
+    NUM_SMS = 8
+    a = torch.randn(M, K, dtype=torch.float16, device=device)
+    b = torch.randn(K, N, dtype=torch.float16, device=device)
+    output = torch.empty((M, N), dtype=torch.float16, device=device)
+    grid = (min(NUM_SMS, triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)), )
+
+    simple_persistent_kernel[grid](
+        a, b, output,  #
+        M, N, K,  #
+        a.stride(0), a.stride(1),  #
+        b.stride(0), b.stride(1),  #
+        output.stride(0), output.stride(1),  #
+        BLOCK_SIZE_M=BLOCK_M, BLOCK_SIZE_N=BLOCK_N, BLOCK_SIZE_K=BLOCK_K,  #
+        GROUP_SIZE_M=8, NUM_SMS=NUM_SMS, DISALLOW_ACC_MULTI_BUFFER=DISALLOW_ACC_MULTI_BUFFER, num_stages=NUM_STAGES,
+        num_warps=NUM_WARPS)
+    ref_out = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.float16)
+    torch.testing.assert_close(ref_out, output, atol=0.01, rtol=0.01)
+
+
 @triton.jit
 def mxfp_matmul(  #
         a_ptr, b_ptr, output_ptr,  #
