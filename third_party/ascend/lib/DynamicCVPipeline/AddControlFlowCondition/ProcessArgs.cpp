@@ -45,11 +45,11 @@ using namespace mlir;
 using namespace CVPipeline;
 using namespace triton;
 
-// Collects iter_arg index -> block_ids that use it. `ivOffset` is 1 for
-// scf.for (IV at arg 0) or 0 for scf.while. Uses body args directly
-// (block-local).
+// 收集 iter_arg 下标到使用它的 block_id。`ivOffset` 在 scf.for 中为 1
+// （第 0 个参数是 IV），在 scf.while 中为 0。消费块可能通过生产算子的
+// 任意结果使用循环携带值，因此需要遍历循环内的完整结果定义使用图。
 static LogicalResult collectArgIndexToBlockIds(
-    Block *body, unsigned ivOffset,
+    Operation *loopOp, Block *body, unsigned ivOffset,
     llvm::DenseMap<int, llvm::DenseSet<int>> &argIndexToBlockIds) {
   if (!body || !body->mightHaveTerminator()) {
     LDBG("[Error]: loop body is invalid or has no terminator");
@@ -66,10 +66,24 @@ static LogicalResult collectArgIndexToBlockIds(
     if (mlir::isa<TensorType>(iterArg.getType())) {
       continue;
     }
-    for (auto &use : iterArg.getUses()) {
-      Operation *owner = use.getOwner();
-      if (auto blockId = getLoopDirectChildBlockId(owner)) {
-        argIndexToBlockIds[argIdx - (int)ivOffset].insert(*blockId);
+    SmallVector<Value> worklist;
+    worklist.push_back(iterArg);
+    llvm::DenseSet<Value> visitedValues;
+    while (!worklist.empty()) {
+      Value value = worklist.pop_back_val();
+      if (!visitedValues.insert(value).second) {
+        continue;
+      }
+
+      for (OpOperand &use : value.getUses()) {
+        Operation *owner = use.getOwner();
+        if (auto blockId = getLoopDirectChildBlockId(owner)) {
+          argIndexToBlockIds[argIdx - (int)ivOffset].insert(*blockId);
+        }
+
+        if (loopOp->isProperAncestor(owner)) {
+          llvm::append_range(worklist, owner->getResults());
+        }
       }
     }
   }
@@ -112,14 +126,22 @@ static LogicalResult findSharedArgs(
   return success();
 }
 
+// 返回 `body` 的 scf.yield 中对应 `argIndex` 的完整 Value。
+// 不能只保留定义算子的第 0 个结果；生产算子可能有多个结果，消费端必须使用
+// yield 精确选中的那个结果。
+static std::optional<Value> findYieldValue(Block *body, unsigned argIndex) {
+  auto yieldOp = cast<scf::YieldOp>(body->getTerminator());
+  if (argIndex >= yieldOp.getNumOperands()) {
+    return std::nullopt;
+  }
+  return yieldOp.getOperand(argIndex);
+}
+
 // Returns the op defining iter_arg at `argIndex` in `body`'s scf.yield (top
 // of update chain), or nullptr if out of bounds. Shared by both paths.
 static Operation *findYieldDefiningOp(Block *body, unsigned argIndex) {
-  auto yieldOp = cast<scf::YieldOp>(body->getTerminator());
-  if (argIndex >= yieldOp.getNumOperands()) {
-    return nullptr;
-  }
-  return yieldOp.getOperand(argIndex).getDefiningOp();
+  auto value = findYieldValue(body, argIndex);
+  return value ? value->getDefiningOp() : nullptr;
 }
 
 // Collects all operations in the computation chain by backward traversal
@@ -152,19 +174,47 @@ static void collectChainOps(Operation *loopOp, Operation *compOp,
 static LogicalResult buildCompInfoForSharedArgs(
     Operation *loopOp, Block *body, SmallVector<SharedArgInfo> &sharedArgsInfo,
     llvm::DenseMap<int, Operation *> &sharedArgToCompOp,
+    llvm::DenseMap<int, Value> &sharedArgToCompValue,
+    llvm::DenseMap<int, llvm::DenseMap<int, SmallVector<Value>>>
+        &sharedArgToConsumerValues,
     llvm::DenseMap<int, llvm::DenseSet<Operation *>> &sharedArgToChainOps) {
   for (auto &info : sharedArgsInfo) {
     int argIndex = info.argIndex;
     if (sharedArgToCompOp.contains(argIndex))
       continue;
 
-    Operation *compOp = findYieldDefiningOp(body, argIndex);
+    auto compValue = findYieldValue(body, argIndex);
+    Operation *compOp = compValue ? compValue->getDefiningOp() : nullptr;
     if (!compOp) {
       continue;
     }
 
     sharedArgToCompOp[argIndex] = compOp;
+    sharedArgToCompValue[argIndex] = *compValue;
+    // 同一生产算子可能产生多个结果，消费块可以使用未直接写入 yield 的
+    // 兄弟结果，因此从生产算子的全部结果开始分析。
+    SmallVector<Value> worklist(compOp->getResults());
+    llvm::DenseSet<Value> visitedValues;
+    while (!worklist.empty()) {
+      Value value = worklist.pop_back_val();
+      if (!visitedValues.insert(value).second)
+        continue;
 
+      for (OpOperand &use : value.getUses()) {
+        Operation *owner = use.getOwner();
+        if (auto blockId = getLoopDirectChildBlockId(owner);
+            blockId && *blockId == info.nonOwnerBlockId) {
+          if (isa<OpResult>(value)) {
+            auto &values =
+                sharedArgToConsumerValues[argIndex][info.nonOwnerBlockId];
+            if (!llvm::is_contained(values, value))
+              values.push_back(value);
+          }
+        }
+        if (loopOp->isProperAncestor(owner))
+          llvm::append_range(worklist, owner->getResults());
+      }
+    }
     llvm::DenseSet<Operation *> chainOps;
     collectChainOps(loopOp, compOp, chainOps);
     sharedArgToChainOps[argIndex] = chainOps;
@@ -204,7 +254,8 @@ cloneChainForBlock(SharedArgInfo &info, Operation *compOp,
       opMapper.map(oldVal, newVal);
     }
 
-    if (resultMapper.contains(op->getResult(0)))
+    if (llvm::all_of(op->getResults(),
+                     [&](Value result) { return resultMapper.contains(result); }))
       continue;
 
     Operation *cloned = cloneBuilder.clone(*op, opMapper);
@@ -217,7 +268,10 @@ cloneChainForBlock(SharedArgInfo &info, Operation *compOp,
     cloned->setAttr(CVPipeline::kArg,
                     cloneBuilder.getI32IntegerAttr(info.argIndex));
 
-    resultMapper.map(op->getResult(0), cloned->getResult(0));
+    for (auto [oldResult, newResult] :
+         llvm::zip_equal(op->getResults(), cloned->getResults())) {
+      resultMapper.map(oldResult, newResult);
+    }
     cloneBuilder.setInsertionPointAfter(cloned);
   }
   return success();
@@ -228,6 +282,9 @@ cloneChainForBlock(SharedArgInfo &info, Operation *compOp,
 static LogicalResult replaceIterArgsInBlock(SharedArgInfo &info,
                                             Block *newBlock,
                                             IRMapping &argRemapping,
+                                            const IRMapping &resultMapper,
+                                            ArrayRef<Value> consumerValues,
+                                            Operation *loopOp,
                                             OpBuilder &cloneBuilder) {
   for (auto arg : newBlock->getArguments()) {
     if (!argRemapping.contains(arg)) {
@@ -238,12 +295,38 @@ static LogicalResult replaceIterArgsInBlock(SharedArgInfo &info,
     SmallVector<OpOperand *, 8> usesToReplace;
     for (OpOperand &use : arg.getUses()) {
       auto blockId = getLoopDirectChildBlockId(use.getOwner());
-      if (blockId && *blockId == info.nonOwnerBlockId) {
+      if (loopOp->isProperAncestor(use.getOwner()) && blockId &&
+          *blockId == info.nonOwnerBlockId) {
         usesToReplace.push_back(&use);
       }
     }
     for (OpOperand *use : usesToReplace) {
       use->set(newVal);
+      use->getOwner()->setAttr(CVPipeline::kArg,
+                               cloneBuilder.getI32IntegerAttr(info.argIndex));
+    }
+  }
+
+  // 消费端条件可能直接读取生产块产生的结果，而不是读取 iter_arg。
+  // 将这些使用重定向到消费块本地克隆链的对应结果。
+  for (Value consumerValue : consumerValues) {
+    if (!resultMapper.contains(consumerValue))
+      continue;
+    Value clonedValue = resultMapper.lookup(consumerValue);
+    SmallVector<OpOperand *, 8> usesToReplace;
+    for (Operation &op : newBlock->without_terminator()) {
+      if (op.hasTrait<OpTrait::IsTerminator>())
+        continue;
+      auto blockId = getLoopDirectChildBlockId(&op);
+      if (!blockId || *blockId != info.nonOwnerBlockId)
+        continue;
+      for (OpOperand &use : op.getOpOperands()) {
+        if (use.get() == consumerValue)
+          usesToReplace.push_back(&use);
+      }
+    }
+    for (OpOperand *use : usesToReplace) {
+      use->set(clonedValue);
       use->getOwner()->setAttr(CVPipeline::kArg,
                                cloneBuilder.getI32IntegerAttr(info.argIndex));
     }
@@ -257,8 +340,12 @@ static LogicalResult replaceIterArgsInBlock(SharedArgInfo &info,
 static LogicalResult processSharedArgsIteration(
     Block *newBlock, SmallVector<SharedArgInfo> &sharedArgsInfo,
     const llvm::DenseMap<int, Operation *> &sharedArgToCompOp,
+    const llvm::DenseMap<int, Value> &sharedArgToCompValue,
+    const llvm::DenseMap<int, llvm::DenseMap<int, SmallVector<Value>>>
+        &sharedArgToConsumerValues,
     const llvm::DenseMap<int, llvm::DenseSet<Operation *>> &sharedArgToChainOps,
-    ValueRange iterArgs, unsigned ivOffset, SmallVector<Value> &clonedResults) {
+    ValueRange iterArgs, unsigned ivOffset, Operation *loopOp,
+    SmallVector<Value> &clonedResults) {
   unsigned numOriginalIterArgs = iterArgs.size();
   unsigned extraIterArgsBase = ivOffset + numOriginalIterArgs;
 
@@ -277,18 +364,29 @@ static LogicalResult processSharedArgsIteration(
     IRMapping argRemapping;
     argRemapping.map(migratedIterArg, newExtraIterArg);
 
+    SmallVector<Value> consumerValues =
+        sharedArgToConsumerValues.lookup(argIndex).lookup(info.nonOwnerBlockId);
+    Operation *firstOpInBlock = nullptr;
     Operation *lastOpInBlock = nullptr;
     for (Operation &op : newBlock->without_terminator()) {
       auto blockIdAttr = op.getAttrOfType<IntegerAttr>(CVPipeline::kBlockId);
       if (blockIdAttr && blockIdAttr.getInt() == info.nonOwnerBlockId) {
+        if (!firstOpInBlock)
+          firstOpInBlock = &op;
         lastOpInBlock = &op;
       }
     }
 
-    OpBuilder cloneBuilder(newBlock, newBlock->end());
-    if (lastOpInBlock) {
-      cloneBuilder.setInsertionPointAfter(lastOpInBlock);
-    }
+    // D072 的消费端条件必须位于消费操作之前；其他共享 arg 保持原有
+    // 插入位置，避免改变既有 IR 顺序。
+    Operation *insertAfter =
+        consumerValues.empty() ? lastOpInBlock : nullptr;
+    Operation *insertBefore =
+        consumerValues.empty() ? nullptr : firstOpInBlock;
+    OpBuilder cloneBuilder(newBlock, insertBefore ? insertBefore->getIterator()
+                                                   : newBlock->end());
+    if (insertAfter)
+      cloneBuilder.setInsertionPointAfter(insertAfter);
 
     IRMapping resultMapper;
     if (failed(cloneChainForBlock(info, sharedArgToCompOp.lookup(argIndex),
@@ -299,12 +397,17 @@ static LogicalResult processSharedArgsIteration(
     }
 
     if (failed(replaceIterArgsInBlock(info, newBlock, argRemapping,
+                                      resultMapper, consumerValues, loopOp,
                                       cloneBuilder))) {
       continue;
     }
 
-    Value clonedResult =
-        resultMapper.lookup(sharedArgToCompOp.lookup(argIndex)->getResult(0));
+    Value compValue = sharedArgToCompValue.lookup(argIndex);
+    if (!resultMapper.contains(compValue)) {
+      LDBG("No cloned result for shared arg " << argIndex);
+      continue;
+    }
+    Value clonedResult = resultMapper.lookup(compValue);
     clonedResults.push_back(clonedResult);
     clonedArgIdx++;
   }
@@ -316,6 +419,9 @@ static LogicalResult processSharedArgsIteration(
 static LogicalResult prepareSharedArgsData(
     Operation *loopOp, Block *body, SmallVector<SharedArgInfo> &sharedArgsInfo,
     llvm::DenseMap<int, Operation *> &sharedArgToCompOp,
+    llvm::DenseMap<int, Value> &sharedArgToCompValue,
+    llvm::DenseMap<int, llvm::DenseMap<int, SmallVector<Value>>>
+        &sharedArgToConsumerValues,
     llvm::DenseMap<int, llvm::DenseSet<Operation *>> &sharedArgToChainOps) {
   if (!body || !body->mightHaveTerminator()) {
     LDBG("[Error]: loop body is invalid or has no terminator");
@@ -326,7 +432,8 @@ static LogicalResult prepareSharedArgsData(
   unsigned ivOffset = isa<scf::ForOp>(loopOp) ? 1 : 0;
 
   llvm::DenseMap<int, llvm::DenseSet<int>> argIndexToBlockIds;
-  if (failed(collectArgIndexToBlockIds(body, ivOffset, argIndexToBlockIds))) {
+  if (failed(collectArgIndexToBlockIds(loopOp, body, ivOffset,
+                                       argIndexToBlockIds))) {
     return failure();
   }
 
@@ -348,6 +455,8 @@ static LogicalResult prepareSharedArgsData(
 
   if (failed(buildCompInfoForSharedArgs(loopOp, body, sharedArgsInfo,
                                         sharedArgToCompOp,
+                                        sharedArgToCompValue,
+                                        sharedArgToConsumerValues,
                                         sharedArgToChainOps))) {
     return failure();
   }
@@ -391,6 +500,9 @@ static LogicalResult processSharedArgsInForOp(
     scf::ForOp forOp, scf::ForOp newForOp,
     SmallVector<SharedArgInfo> &sharedArgsInfo,
     const llvm::DenseMap<int, Operation *> &sharedArgToCompOp,
+    const llvm::DenseMap<int, Value> &sharedArgToCompValue,
+    const llvm::DenseMap<int, llvm::DenseMap<int, SmallVector<Value>>>
+        &sharedArgToConsumerValues,
     const llvm::DenseMap<int, llvm::DenseSet<Operation *>> &sharedArgToChainOps,
     ControlFlowConditionInfo *info) {
   Block *oldBlock = forOp.getBody();
@@ -399,8 +511,9 @@ static LogicalResult processSharedArgsInForOp(
 
   SmallVector<Value> clonedResults;
   if (failed(processSharedArgsIteration(
-          newBlock, sharedArgsInfo, sharedArgToCompOp, sharedArgToChainOps,
-          MainLoop(forOp).getIterArgs(), 1, clonedResults))) {
+          newBlock, sharedArgsInfo, sharedArgToCompOp, sharedArgToCompValue,
+          sharedArgToConsumerValues, sharedArgToChainOps,
+          MainLoop(forOp).getIterArgs(), 1, newForOp, clonedResults))) {
     return failure();
   }
   if (failed(buildNewYieldOp(oldBlock, newBlock, newForOp, clonedResults))) {
@@ -415,6 +528,9 @@ LogicalResult ProcessArgsPass::processSharedArgsInWhileOp(
     scf::WhileOp whileOp, scf::WhileOp newWhileOp,
     SmallVector<SharedArgInfo> &sharedArgsInfo,
     const llvm::DenseMap<int, Operation *> &sharedArgToCompOp,
+    const llvm::DenseMap<int, Value> &sharedArgToCompValue,
+    const llvm::DenseMap<int, llvm::DenseMap<int, SmallVector<Value>>>
+        &sharedArgToConsumerValues,
     const llvm::DenseMap<int, llvm::DenseSet<Operation *>> &sharedArgToChainOps,
     ControlFlowConditionInfo *info) {
   migrateWhileBodies(whileOp, newWhileOp);
@@ -422,8 +538,8 @@ LogicalResult ProcessArgsPass::processSharedArgsInWhileOp(
   SmallVector<Value> clonedResults;
   if (failed(processSharedArgsIteration(
           newWhileOp.getAfterBody(), sharedArgsInfo, sharedArgToCompOp,
-          sharedArgToChainOps, MainLoop(whileOp).getIterArgs(), 0,
-          clonedResults))) {
+          sharedArgToCompValue, sharedArgToConsumerValues, sharedArgToChainOps,
+          MainLoop(whileOp).getIterArgs(), 0, newWhileOp, clonedResults))) {
     return failure();
   }
   buildNewWhileCondition(whileOp, newWhileOp);
@@ -468,9 +584,14 @@ ProcessArgsPass::processSharedIterArgsInLoop(Operation *op,
 
   SmallVector<SharedArgInfo> sharedArgsInfo;
   llvm::DenseMap<int, Operation *> sharedArgToCompOp;
+  llvm::DenseMap<int, Value> sharedArgToCompValue;
+  llvm::DenseMap<int, llvm::DenseMap<int, SmallVector<Value>>>
+      sharedArgToConsumerValues;
   llvm::DenseMap<int, llvm::DenseSet<Operation *>> sharedArgToChainOps;
   if (failed(prepareSharedArgsData(op, inspectBody, sharedArgsInfo,
-                                   sharedArgToCompOp, sharedArgToChainOps))) {
+                                   sharedArgToCompOp, sharedArgToCompValue,
+                                   sharedArgToConsumerValues,
+                                   sharedArgToChainOps))) {
     return failure();
   }
   if (sharedArgsInfo.empty()) {
@@ -499,11 +620,14 @@ ProcessArgsPass::processSharedIterArgsInLoop(Operation *op,
   if (auto forOp = dyn_cast<scf::ForOp>(op)) {
     return processSharedArgsInForOp(forOp, cast<scf::ForOp>(newOp),
                                     sharedArgsInfo, sharedArgToCompOp,
+                                    sharedArgToCompValue,
+                                    sharedArgToConsumerValues,
                                     sharedArgToChainOps, info);
   }
   return processSharedArgsInWhileOp(
       cast<scf::WhileOp>(op), cast<scf::WhileOp>(newOp), sharedArgsInfo,
-      sharedArgToCompOp, sharedArgToChainOps, info);
+      sharedArgToCompOp, sharedArgToCompValue, sharedArgToConsumerValues,
+      sharedArgToChainOps, info);
 }
 
 // Walks module to find for/while ops with ssbuffer.main_loop attribute and
