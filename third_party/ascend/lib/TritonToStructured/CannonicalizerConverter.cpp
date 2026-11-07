@@ -60,6 +60,7 @@
 
 #include "llvm/Support/Debug.h"
 
+#include "TritonToStructured/InvariantAxisAnalysis.h"
 #include "TritonToStructured/PtrAnalysis.h"
 #include "TritonToStructured/TritonToStructuredPass.h"
 #include "Utils/InterleaveOptimization.h"
@@ -244,227 +245,312 @@ AddPtrSplatConverter::matchAndRewrite(triton::AddPtrOp addPtrOp,
   return success();
 }
 
-// Move load before broadcast when possible:
-// If load.ptr is a triton::BroadcastOp and
-//  - load.mask is null; or
-//  - load.mask is a triton::BroadcastOp,
-// then rewrite the load in one of two ways depending on whether the ptr src
-// and mask src shapes match:
+// Move a load out of every proven-invariant non-unit axis. Such an axis does
+// not contribute to the pointer value, so loading a single representative
+// slice and broadcasting it back is exactly equivalent:
+//   %v_small = tt.load %ptr[..0..], %small_mask?, %small_other?
+//   %v       = tt.broadcast %v_small
+// The pointer facts come from InvariantAxisAnalysis, which understands
+// broadcast/expand_dims/splat, multi-level addptr, pointer bitcasts,
+// extract_slice, scf.for iter_args and scf.if results. This replaces the old
+// syntactic match on `load.ptr -> tt.broadcast`, which missed every case where
+// the broadcast is hidden behind a bitcast or a loop-carried pointer.
 //
-// Case 1 (shapes match, original fast path):
-//   %ptr_b  = tt.broadcast %ptr_src
-//   %mask_b = tt.broadcast %mask_src        (src shapes identical)
-//   %v = tt.load %ptr_b, %mask_b, %other_splat
-// becomes:
-//   %v_small = tt.load %ptr_src, %mask_src, %other_small
-//   %v = tt.broadcast %v_small
-//
-// Case 2 (shapes differ, e.g. ptr and mask broadcast on different axes):
-//   %ptr_b  = tt.broadcast %ptr_src         // e.g. [1,64] -> [256,64]
-//   %mask_b = tt.broadcast %mask_src        // e.g. [256,1] -> [256,64]
-//   %v = tt.load %ptr_b, %mask_b, %other
-// becomes:
-//   %v_small = tt.load %ptr_src             (no mask, no other — safe)
-//   %v_bc    = tt.broadcast %v_small
-//   %v       = arith.select %mask_b, %v_bc, %other
-// The full mask is applied via select after broadcast, which downstream
-// select analysis lowers to extract_slice / insert_slice.
+// If the mask varies along a compressed axis the small load runs unmasked and
+// the complete-shape mask/other is applied with arith.select afterwards, so no
+// per-element semantics are lost.
 LogicalResult
 LoadBroadcastConverter::matchAndRewrite(triton::LoadOp loadOp,
                                         PatternRewriter &rewriter) const {
-  // Match when ptr is defined by BroadcastOp
+  if (loadOp.getIsVolatile())
+    return failure();
+
   Value ptr = loadOp.getPtr();
-  auto ptrBroadcast = ptr.getDefiningOp<triton::BroadcastOp>();
-  if (!ptrBroadcast)
+  auto ptrType = dyn_cast<RankedTensorType>(ptr.getType());
+  auto resultType = dyn_cast<RankedTensorType>(loadOp.getResult().getType());
+  if (!ptrType || !resultType || !ptrType.hasStaticShape() ||
+      ptrType.getShape() != resultType.getShape())
     return failure();
 
-  auto ptrSrcType = dyn_cast<RankedTensorType>(ptrBroadcast.getSrc().getType());
-  if (!ptrSrcType)
+  TritonToStructured::InvariantAxisAnalysis axisAnalysis;
+  auto invariant = axisAnalysis.analyze(ptr);
+  if (failed(invariant) || invariant->size() != ptrType.getRank())
     return failure();
 
-  // mask can be null
-  Value mask = loadOp.getMask();
-  triton::BroadcastOp maskBroadcast = nullptr;
-  Value maskSrc = nullptr;
-  RankedTensorType maskSrcType = nullptr;
-  if (mask) {
-    maskBroadcast = mask.getDefiningOp<triton::BroadcastOp>();
-    if (!maskBroadcast)
-      return failure();
-    maskSrc = maskBroadcast.getSrc();
-    maskSrcType = dyn_cast<RankedTensorType>(maskSrc.getType());
-    if (!maskSrcType)
-      return failure();
+  SmallVector<int64_t> smallShape(ptrType.getShape());
+  SmallVector<unsigned> compressedAxes;
+  for (auto [axis, dim] : llvm::enumerate(smallShape)) {
+    if (dim > 1 && (*invariant)[axis]) {
+      dim = 1;
+      compressedAxes.push_back(axis);
+    }
+  }
+  if (compressedAxes.empty())
+    return failure();
+  // A fully uniform pointer already goes through the existing scalar/splat
+  // lowering; do not expand this rewrite's blast radius.
+  if (llvm::none_of(smallShape, [](int64_t dim) { return dim > 1; }))
+    return failure();
+
+  auto smallPtrType = ptrType.clone(smallShape);
+  auto smallValueType = resultType.clone(smallShape);
+  SmallVector<OpFoldResult> offsets, sizes, strides;
+  for (int64_t dim : smallShape) {
+    offsets.push_back(rewriter.getIndexAttr(0));
+    sizes.push_back(rewriter.getIndexAttr(dim));
+    strides.push_back(rewriter.getIndexAttr(1));
   }
 
   Location loc = loadOp.getLoc();
-  Value smallPtr = ptrBroadcast.getSrc();
+  // PtrAnalysis only recognizes the bool load when the source pointer is
+  // sliced in its original ptr<i1> form and narrowed to ptr<i8> afterwards.
+  bool isBoolToInt8 = loadOp->hasAttr("was_bool_to_int8");
+  Value boolSourcePtr;
+  if (isBoolToInt8) {
+    auto bitcast = ptr.getDefiningOp<triton::BitcastOp>();
+    if (!bitcast)
+      return failure();
+    auto sourceType = dyn_cast<RankedTensorType>(bitcast.getSrc().getType());
+    auto targetType = dyn_cast<RankedTensorType>(bitcast.getType());
+    auto sourcePtrType =
+        sourceType ? dyn_cast<triton::PointerType>(sourceType.getElementType())
+                   : nullptr;
+    auto targetPtrType =
+        targetType ? dyn_cast<triton::PointerType>(targetType.getElementType())
+                   : nullptr;
+    if (!sourceType || !targetType || targetType != ptrType ||
+        sourceType.getShape() != targetType.getShape() || !sourcePtrType ||
+        !targetPtrType ||
+        sourcePtrType.getPointeeType() != rewriter.getI1Type() ||
+        targetPtrType.getPointeeType() != rewriter.getI8Type())
+      return failure();
+    boolSourcePtr = bitcast.getSrc();
+  }
 
-  // Preserve other operands of load (like 'other', cache, evict, isVolatile)
+  Value smallPtr;
+  Value ptrSource = isBoolToInt8 ? boolSourcePtr : ptr;
+  if (auto broadcast = ptrSource.getDefiningOp<triton::BroadcastOp>()) {
+    auto sourceType = dyn_cast<RankedTensorType>(broadcast.getSrc().getType());
+    if (sourceType && llvm::equal(sourceType.getShape(), smallShape))
+      smallPtr = broadcast.getSrc();
+  }
+  if (!smallPtr) {
+    auto extractType = ptrType.clone(smallShape);
+    if (isBoolToInt8)
+      extractType =
+          cast<RankedTensorType>(boolSourcePtr.getType()).clone(smallShape);
+    smallPtr = rewriter.create<tensor::ExtractSliceOp>(
+        loc, extractType, ptrSource, offsets, sizes, strides);
+  }
+  if (isBoolToInt8)
+    smallPtr = rewriter.create<triton::BitcastOp>(loc, smallPtrType, smallPtr);
+
+  Value mask = loadOp.getMask();
+  Value smallMask;
+  bool maskCanBeCompressed = static_cast<bool>(mask);
+  if (mask) {
+    auto maskType = dyn_cast<RankedTensorType>(mask.getType());
+    if (!maskType || !maskType.hasStaticShape() ||
+        maskType.getShape() != ptrType.getShape())
+      maskCanBeCompressed = false;
+    if (maskCanBeCompressed) {
+      auto maskInvariant = axisAnalysis.analyze(mask);
+      maskCanBeCompressed =
+          succeeded(maskInvariant) &&
+          llvm::all_of(compressedAxes, [&](unsigned axis) {
+            return (*maskInvariant)[axis];
+          });
+    }
+    if (maskCanBeCompressed) {
+      if (auto broadcast = mask.getDefiningOp<triton::BroadcastOp>()) {
+        auto sourceType =
+            dyn_cast<RankedTensorType>(broadcast.getSrc().getType());
+        if (sourceType && llvm::equal(sourceType.getShape(), smallShape))
+          smallMask = broadcast.getSrc();
+      }
+    }
+    if (maskCanBeCompressed && !smallMask)
+      smallMask = rewriter.create<tensor::ExtractSliceOp>(
+          loc, maskType.clone(smallShape), mask, offsets, sizes, strides);
+  }
+
   Value other = loadOp.getOther();
   auto cache = loadOp.getCache();
   auto evict = loadOp.getEvict();
   auto isVolatile = loadOp.getIsVolatile();
-  auto resultType = dyn_cast<RankedTensorType>(loadOp.getResult().getType());
-  if (!resultType)
-    return failure();
 
-  bool shapesMatch = !mask || (ptrSrcType.getShape() == maskSrcType.getShape());
-
-  // no mask, or ptr/mask src shapes match
-  if (shapesMatch) {
-    Value newOther = other;
+  if (!mask || maskCanBeCompressed) {
+    Value smallOther;
+    bool selectOther = false;
     if (other) {
-      // Build a small-shaped 'other' constant matching ptr src shape.
-      // Only splat dense constants are supported here (same as before).
       Attribute otherAttr;
-      if (!matchPattern(other, m_Constant(&otherAttr)))
-        return failure();
-      auto denseOther = dyn_cast<DenseElementsAttr>(otherAttr);
-      if (!denseOther)
-        return failure();
-
-      auto elemType = denseOther.getType().getElementType();
-      if (!elemType)
-        return failure();
-      auto smallType = RankedTensorType::get(ptrSrcType.getShape(), elemType);
-
-      DenseElementsAttr newDense;
-      if (denseOther.isSplat()) {
-        newDense = DenseElementsAttr::get(
-            smallType, denseOther.getSplatValue<Attribute>());
+      auto denseOther = matchPattern(other, m_Constant(&otherAttr))
+                            ? dyn_cast<DenseElementsAttr>(otherAttr)
+                            : DenseElementsAttr{};
+      if (denseOther && denseOther.isSplat()) {
+        smallOther = rewriter.create<arith::ConstantOp>(
+            loc, DenseElementsAttr::get(smallValueType,
+                                        denseOther.getSplatValue<Attribute>()));
       } else {
-        return failure();
+        // The small load only supplies values where the full mask is true, so
+        // the original fallback is applied after broadcasting.
+        selectOther = true;
       }
-      newOther = rewriter.create<arith::ConstantOp>(loc, newDense).getResult();
     }
-
     auto newLoad = rewriter.create<triton::LoadOp>(
-        loc, smallPtr, maskSrc, newOther, cache, evict, isVolatile);
+        loc, smallPtr, smallMask, smallOther, cache, evict, isVolatile);
+    if (isBoolToInt8)
+      newLoad->setAttr("was_bool_to_int8", loadOp->getAttr("was_bool_to_int8"));
     auto broadcasted = rewriter.create<triton::BroadcastOp>(
         loc, resultType, newLoad.getResult());
-    rewriter.replaceOp(loadOp, broadcasted.getResult());
+    Value replacement = broadcasted.getResult();
+    if (selectOther) {
+      replacement =
+          rewriter.create<arith::SelectOp>(loc, mask, replacement, other);
+    }
+    rewriter.replaceOp(loadOp, replacement);
     return success();
   }
 
   auto newLoad = rewriter.create<triton::LoadOp>(
       loc, smallPtr, /*mask=*/nullptr, /*other=*/nullptr, cache, evict,
       isVolatile);
-  auto broadcasted = rewriter.create<triton::BroadcastOp>(loc, resultType,
-                                                          newLoad.getResult());
-  Value result = broadcasted.getResult();
-
-  if (!other) {
-    // default for masked-off elements is 0
+  if (isBoolToInt8)
+    newLoad->setAttr("was_bool_to_int8", loadOp->getAttr("was_bool_to_int8"));
+  auto broadcasted = rewriter.create<triton::BroadcastOp>(
+      loc, resultType, newLoad.getResult());
+  Value fallback = other;
+  if (!fallback) {
     auto zeroAttr = DenseElementsAttr::get(
         resultType, rewriter.getZeroAttr(resultType.getElementType()));
-    other = rewriter.create<arith::ConstantOp>(loc, zeroAttr).getResult();
+    fallback = rewriter.create<arith::ConstantOp>(loc, zeroAttr).getResult();
   }
-  auto selectOp = rewriter.create<arith::SelectOp>(loc, mask, result, other);
+  auto selectOp = rewriter.create<arith::SelectOp>(loc, mask,
+                                                   broadcasted.getResult(),
+                                                   fallback);
   rewriter.replaceOp(loadOp, selectOp.getResult());
   return success();
 }
 
-// Move store before broadcast when possible:
-// If store.ptr is defined by a triton::BroadcastOp, the broadcast axes refer
-// to the same memory locations (every pointer along a broadcast axis points
-// to the same address), so storing once at the first index of each broadcast
-// axis is sufficient. Rewrite
-//   %ptr   = tt.broadcast %ptr_src            // e.g. [32,1] -> [32,32]
-//   %mask  = tt.broadcast %mask_src?          // optional, same expansion
-//   tt.store %ptr, %val, %mask?
-// with
-//   %val_small  = tensor.extract_slice %val[..0..]  // first index per
-//                                                    // broadcast axis
+// Move a store out of every proven-invariant non-unit axis. All elements along
+// such an axis alias the same address, so writing the representative slice once
+// is equivalent to writing every element:
+//   %val_small  = tensor.extract_slice %val[..0..]
 //   %mask_small = %mask_src | tensor.extract_slice %mask
-//   tt.store %ptr_src, %val_small, %mask_small?
+//   tt.store %ptr_small, %val_small, %mask_small?
+// Facts come from the same InvariantAxisAnalysis used for loads, so this also
+// covers bitcast pointers, loop-carried pointers and multi-level addptr.
 LogicalResult
 StoreBroadcastConverter::matchAndRewrite(triton::StoreOp storeOp,
                                          PatternRewriter &rewriter) const {
-  // Match when ptr is defined by BroadcastOp
   Value ptr = storeOp.getPtr();
-  auto ptrBroadcast = ptr.getDefiningOp<triton::BroadcastOp>();
-  if (!ptrBroadcast)
+  auto ptrType = dyn_cast<RankedTensorType>(ptr.getType());
+  if (!ptrType || !ptrType.hasStaticShape())
     return failure();
 
-  auto ptrSrcType = dyn_cast<RankedTensorType>(ptrBroadcast.getSrc().getType());
-  auto resultType = dyn_cast<RankedTensorType>(ptr.getType());
-  if (!ptrSrcType || !resultType)
+  TritonToStructured::InvariantAxisAnalysis axisAnalysis;
+  auto invariant = axisAnalysis.analyze(ptr);
+  if (failed(invariant) || invariant->size() != ptrType.getRank())
     return failure();
 
-  // Find the axes expanded by broadcast (src size 1 -> full size)
-  auto srcShape = ptrSrcType.getShape();
-  auto resultShape = resultType.getShape();
-  SmallVector<int64_t> broadcastAxes;
-  for (size_t i = 0; i < srcShape.size(); ++i) {
-    if (srcShape[i] == 1 && resultShape[i] != 1)
-      broadcastAxes.push_back(i);
+  SmallVector<int64_t> smallShape(ptrType.getShape());
+  SmallVector<unsigned> compressedAxes;
+  for (auto [axis, dim] : llvm::enumerate(smallShape)) {
+    if (dim > 1 && (*invariant)[axis]) {
+      dim = 1;
+      compressedAxes.push_back(axis);
+    }
   }
-  if (broadcastAxes.empty())
+  if (compressedAxes.empty())
+    return failure();
+  // A fully uniform pointer is already handled by the existing scalar store
+  // path (splat + scalar value). Compressing it to rank-N singleton would
+  // produce an extract_slice over a splat that PtrAnalysis cannot consume.
+  if (llvm::none_of(smallShape, [](int64_t dim) { return dim > 1; }))
     return failure();
 
   Location loc = storeOp.getLoc();
   SmallVector<OpFoldResult> offsets, sizes, strides;
-  for (size_t i = 0; i < resultShape.size(); ++i) {
+  for (int64_t dim : smallShape) {
     offsets.push_back(rewriter.getIndexAttr(0));
+    sizes.push_back(rewriter.getIndexAttr(dim));
     strides.push_back(rewriter.getIndexAttr(1));
-    sizes.push_back(rewriter.getIndexAttr(resultShape[i]));
   }
-  for (auto axis : broadcastAxes)
-    sizes[axis] = rewriter.getIndexAttr(1);
 
-  // Slice value along the broadcast axes (first index) if it has the full
-  // broadcast shape; otherwise it must already match the small ptr shape.
+  Value smallPtr;
+  if (auto broadcast = ptr.getDefiningOp<triton::BroadcastOp>()) {
+    auto sourceType = dyn_cast<RankedTensorType>(broadcast.getSrc().getType());
+    if (sourceType && llvm::equal(sourceType.getShape(), smallShape))
+      smallPtr = broadcast.getSrc();
+  }
+  if (!smallPtr)
+    smallPtr = rewriter.create<tensor::ExtractSliceOp>(
+        loc, ptrType.clone(smallShape), ptr, offsets, sizes, strides);
+
+  // Slice the stored value when it has the full shape; a value that already
+  // matches the small shape (for example a scalar splat) is used as is.
+  // Along a compressed axis every position aliases one address, so the value
+  // and mask must be identical there; otherwise keeping only index 0 would
+  // change which value lands in memory. Values we cannot prove invariant fall
+  // back to the unmodified store.
   Value newValue = storeOp.getValue();
   if (auto valueType = dyn_cast<RankedTensorType>(newValue.getType())) {
-    if (valueType.getShape() == resultShape) {
+    if (valueType.getShape() == ptrType.getShape()) {
+      auto valueInvariant = axisAnalysis.analyze(newValue);
+      if (failed(valueInvariant) ||
+          llvm::any_of(compressedAxes, [&](unsigned axis) {
+            return !(*valueInvariant)[axis];
+          }))
+        return failure();
       newValue = rewriter.create<tensor::ExtractSliceOp>(loc, newValue, offsets,
                                                          sizes, strides);
-    } else if (valueType.getShape() != srcShape) {
+    } else if (valueType.getShape() != ArrayRef<int64_t>(smallShape)) {
       return failure();
     }
   }
 
-  // Slice mask the same way; reuse mask's broadcast source when its shape
-  // matches the small ptr shape, avoiding a redundant extract_slice.
   Value newMask;
   if (Value mask = storeOp.getMask()) {
     auto maskType = dyn_cast<RankedTensorType>(mask.getType());
     if (!maskType)
       return failure();
-    if (maskType.getShape() == resultShape) {
-      Value maskSrc = nullptr;
+    if (maskType.getShape() == ptrType.getShape()) {
+      auto maskInvariant = axisAnalysis.analyze(mask);
+      if (failed(maskInvariant) ||
+          llvm::any_of(compressedAxes, [&](unsigned axis) {
+            return !(*maskInvariant)[axis];
+          }))
+        return failure();
+      Value maskSrc;
       if (auto maskBroadcast = mask.getDefiningOp<triton::BroadcastOp>()) {
         auto maskSrcType =
             dyn_cast<RankedTensorType>(maskBroadcast.getSrc().getType());
-        if (maskSrcType && maskSrcType.getShape() == srcShape)
+        if (maskSrcType && llvm::equal(maskSrcType.getShape(), smallShape))
           maskSrc = maskBroadcast.getSrc();
       }
-      newMask =
-          maskSrc ? maskSrc
-                  : static_cast<Value>(rewriter.create<tensor::ExtractSliceOp>(
-                        loc, mask, offsets, sizes, strides));
-    } else if (maskType.getShape() != srcShape) {
+      newMask = maskSrc ? maskSrc
+                        : static_cast<Value>(rewriter.create<tensor::ExtractSliceOp>(
+                              loc, maskType.clone(smallShape), mask, offsets,
+                              sizes, strides));
+    } else if (maskType.getShape() != ArrayRef<int64_t>(smallShape)) {
       return failure();
     } else {
       newMask = mask;
     }
   }
 
-  // Store the reduced slice; broadcast dims all alias the same address.
   if (newMask) {
-    rewriter.create<triton::StoreOp>(loc, ptrBroadcast.getSrc(), newValue,
-                                     newMask, storeOp.getBoundaryCheck(),
+    rewriter.create<triton::StoreOp>(loc, smallPtr, newValue, newMask,
+                                     storeOp.getBoundaryCheck(),
                                      storeOp.getCache(), storeOp.getEvict());
   } else {
-    rewriter.create<triton::StoreOp>(loc, ptrBroadcast.getSrc(), newValue,
+    rewriter.create<triton::StoreOp>(loc, smallPtr, newValue,
                                      storeOp.getBoundaryCheck(),
                                      storeOp.getCache(), storeOp.getEvict());
   }
   rewriter.eraseOp(storeOp);
   return success();
 }
-
 LogicalResult ZeroStrideMakeTensorPtrConverter::matchAndRewrite(
     triton::MakeTensorPtrOp op, PatternRewriter &rewriter) const {
   // Only rewrite when every stride is statically 0; any non-zero stride

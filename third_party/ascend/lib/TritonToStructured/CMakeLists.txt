@@ -4,6 +4,7 @@ add_triton_library(TritonToStructured
         CannonicalizerConverter.cpp
         MemOpConverter.cpp
         MaskAnalysis.cpp
+        InvariantAxisAnalysis.cpp
 
   DEPENDS
   TritonToStructuredConversionPassIncGen
