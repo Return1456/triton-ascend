@@ -90,6 +90,9 @@ void TritonToStructuredPass::populateTritonToStructuredCanonicalizationPatterns(
       patterns.getContext());
   patterns.add<CannonicalizerConverter::SimplifyTensorIterArgsPattern>(
       patterns.getContext());
+  // Expose ordinary pointer arithmetic to PtrAnalysis before rewriting it.
+  patterns.add<CannonicalizerConverter::PointerBitcastCanonicalizer>(
+      patterns.getContext());
   // Add addptr splat->broadcast hoisting converter
   patterns.add<CannonicalizerConverter::AddPtrSplatConverter>(
       patterns.getContext());

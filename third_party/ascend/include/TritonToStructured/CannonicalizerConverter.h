@@ -69,6 +69,18 @@ public:
                                 PatternRewriter &rewriter) const override;
 };
 
+// Push a storage-width-preserving pointer bitcast through pointer arithmetic.
+// PtrAnalysis can then analyze ordinary splat/addptr/broadcast operations
+// instead of treating a tensor pointer bitcast as an opaque base.
+class PointerBitcastCanonicalizer : public OpRewritePattern<triton::BitcastOp> {
+public:
+  explicit PointerBitcastCanonicalizer(MLIRContext *context)
+      : OpRewritePattern<triton::BitcastOp>(context) {}
+
+  LogicalResult matchAndRewrite(triton::BitcastOp op,
+                                PatternRewriter &rewriter) const override;
+};
+
 class LoadBroadcastConverter : public OpRewritePattern<triton::LoadOp> {
 public:
   explicit LoadBroadcastConverter(MLIRContext *context)

@@ -244,6 +244,163 @@ AddPtrSplatConverter::matchAndRewrite(triton::AddPtrOp addPtrOp,
   return success();
 }
 
+// The Ascend ABI stores i1 in one byte. Only explicitly supported scalar ABI
+// types are rewritten, so unusual integer/float widths remain untouched.
+static std::optional<unsigned> getPointerStorageBits(Type type) {
+  if (auto intType = dyn_cast<IntegerType>(type)) {
+    unsigned width = intType.getWidth();
+    if (width == 1)
+      return 8u;
+    if (width == 8 || width == 16 || width == 32 || width == 64)
+      return width;
+    return std::nullopt;
+  }
+  if (auto floatType = dyn_cast<FloatType>(type)) {
+    if (floatType.isF16() || floatType.isBF16() || floatType.isF32() ||
+        floatType.isF64())
+      return floatType.getWidth();
+  }
+  return std::nullopt;
+}
+
+static FailureOr<triton::PointerType> getScalarPointerType(Type type) {
+  if (auto tensorType = dyn_cast<RankedTensorType>(type))
+    type = tensorType.getElementType();
+  auto pointerType = dyn_cast<triton::PointerType>(type);
+  if (!pointerType)
+    return failure();
+  return pointerType;
+}
+
+static bool hasCompatiblePointerCastTypes(Type sourceType, Type resultType) {
+  auto sourcePtr = getScalarPointerType(sourceType);
+  auto resultPtr = getScalarPointerType(resultType);
+  if (failed(sourcePtr) || failed(resultPtr))
+    return false;
+
+  auto sourceTensor = dyn_cast<RankedTensorType>(sourceType);
+  auto resultTensor = dyn_cast<RankedTensorType>(resultType);
+  if (static_cast<bool>(sourceTensor) != static_cast<bool>(resultTensor))
+    return false;
+  if (sourceTensor &&
+      (sourceTensor.getShape() != resultTensor.getShape() ||
+       sourceTensor.getEncoding() != resultTensor.getEncoding()))
+    return false;
+
+  if (sourcePtr->getAddressSpace() != resultPtr->getAddressSpace())
+    return false;
+  auto sourceBits = getPointerStorageBits(sourcePtr->getPointeeType());
+  auto resultBits = getPointerStorageBits(resultPtr->getPointeeType());
+  return sourceBits && resultBits && *sourceBits == *resultBits;
+}
+
+static Type replacePointerElementType(Type type,
+                                      triton::PointerType pointerType) {
+  if (auto tensorType = dyn_cast<RankedTensorType>(type))
+    return tensorType.cloneWith(std::nullopt, pointerType);
+  return pointerType;
+}
+
+static Value createPointerBitcast(Location loc, Value source, Type resultType,
+                                  PatternRewriter &rewriter) {
+  if (source.getType() == resultType)
+    return source;
+  return rewriter.create<triton::BitcastOp>(loc, resultType, source);
+}
+
+LogicalResult
+PointerBitcastCanonicalizer::matchAndRewrite(triton::BitcastOp bitcastOp,
+                                             PatternRewriter &rewriter) const {
+  Value source = bitcastOp.getSrc();
+  Type sourceType = source.getType();
+  Type resultType = bitcastOp.getType();
+  if (!hasCompatiblePointerCastTypes(sourceType, resultType))
+    return rewriter.notifyMatchFailure(
+        bitcastOp, "pointer bitcast changes shape, encoding, address space, "
+                   "or ABI storage width");
+
+  Operation *producer = source.getDefiningOp();
+  if (!producer)
+    return failure();
+
+  Location loc = bitcastOp.getLoc();
+  auto resultPtr =
+      cast<triton::PointerType>(getScalarPointerType(resultType).value());
+
+  // bitcast(bitcast(x)) -> bitcast(x), preserving the final result type.
+  if (auto previousCast = dyn_cast<triton::BitcastOp>(producer)) {
+    if (!hasCompatiblePointerCastTypes(previousCast.getSrc().getType(),
+                                       resultType))
+      return rewriter.notifyMatchFailure(
+          bitcastOp, "nested pointer bitcast is not ABI-compatible");
+    auto merged = rewriter.create<triton::BitcastOp>(loc, resultType,
+                                                     previousCast.getSrc());
+    rewriter.replaceOp(bitcastOp, merged.getResult());
+    if (previousCast->use_empty())
+      rewriter.eraseOp(previousCast);
+    return success();
+  }
+
+  // bitcast(addptr(base, offset)) -> addptr(bitcast(base), offset)
+  if (auto addPtrOp = dyn_cast<triton::AddPtrOp>(producer)) {
+    Type castBaseType =
+        replacePointerElementType(addPtrOp.getPtr().getType(), resultPtr);
+    Value castBase =
+        createPointerBitcast(loc, addPtrOp.getPtr(), castBaseType, rewriter);
+    auto newAddPtr = rewriter.create<triton::AddPtrOp>(
+        loc, resultType, castBase, addPtrOp.getOffset());
+    rewriter.replaceOp(bitcastOp, newAddPtr.getResult());
+    if (addPtrOp->use_empty())
+      rewriter.eraseOp(addPtrOp);
+    return success();
+  }
+
+  // bitcast(splat(ptr)) -> splat(bitcast(ptr))
+  if (auto splatOp = dyn_cast<triton::SplatOp>(producer)) {
+    Value castScalar = createPointerBitcast(
+        loc, splatOp.getSrc(),
+        replacePointerElementType(splatOp.getSrc().getType(), resultPtr),
+        rewriter);
+    auto newSplat =
+        rewriter.create<triton::SplatOp>(loc, resultType, castScalar);
+    rewriter.replaceOp(bitcastOp, newSplat.getResult());
+    if (splatOp->use_empty())
+      rewriter.eraseOp(splatOp);
+    return success();
+  }
+
+  // bitcast(broadcast(x)) -> broadcast(bitcast(x))
+  if (auto broadcastOp = dyn_cast<triton::BroadcastOp>(producer)) {
+    Type castSourceType =
+        replacePointerElementType(broadcastOp.getSrc().getType(), resultPtr);
+    Value castSource = createPointerBitcast(loc, broadcastOp.getSrc(),
+                                            castSourceType, rewriter);
+    auto newBroadcast =
+        rewriter.create<triton::BroadcastOp>(loc, resultType, castSource);
+    rewriter.replaceOp(bitcastOp, newBroadcast.getResult());
+    if (broadcastOp->use_empty())
+      rewriter.eraseOp(broadcastOp);
+    return success();
+  }
+
+  // bitcast(expand_dims(x)) -> expand_dims(bitcast(x))
+  if (auto expandDimsOp = dyn_cast<triton::ExpandDimsOp>(producer)) {
+    Type castSourceType =
+        replacePointerElementType(expandDimsOp.getSrc().getType(), resultPtr);
+    Value castSource = createPointerBitcast(loc, expandDimsOp.getSrc(),
+                                            castSourceType, rewriter);
+    auto newExpandDims = rewriter.create<triton::ExpandDimsOp>(
+        loc, castSource, expandDimsOp.getAxis());
+    rewriter.replaceOp(bitcastOp, newExpandDims.getResult());
+    if (expandDimsOp->use_empty())
+      rewriter.eraseOp(expandDimsOp);
+    return success();
+  }
+
+  return rewriter.notifyMatchFailure(bitcastOp,
+                                     "unsupported pointer bitcast producer");
+}
+
 // Move load before broadcast when possible:
 // If load.ptr is a triton::BroadcastOp and
 //  - load.mask is null; or
